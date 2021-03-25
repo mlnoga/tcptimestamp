@@ -291,24 +291,28 @@ func pass2(filename string, sourceIP net.IP, startTime time.Time, tickStart uint
 			continue
 		}
 
+		var captureMs int64
+		var ticksElapsed uint32
+		var tcpMs, deltaMs int64
 		for _,o:=range(tcp.Options) {
 			if o.OptionType!=8 {  // throw away all but the timestamp
 				continue;
 			} 
 
+			// convert capture timestamp into estimated milliseconds since start of capture
+			captureMs=ci.Timestamp.Sub(startTime).Milliseconds()
 			// convert TCP timestamp into estimated milliseconds since start of capture
 			ticks:=tcpTimestampToTicks(o.OptionData)
-			ticksElapsed:=ticks-tickStart
-			tcpMs:=int64(float64(ticksElapsed)/ticksPerMS)
+			ticksElapsed=ticks-tickStart
+			tcpMs=int64(float64(ticksElapsed)/ticksPerMS)
 
-			// convert capture timestamp into estimated milliseconds since start of capture
-			captureMs:=ci.Timestamp.Sub(startTime).Milliseconds()
-
-			deltaMs:=int64(captureMs-tcpMs)
+			deltaMs=int64(captureMs-tcpMs)
 			if deltaMs>thresholdMs {
 				res.PacketIDs[packetID]=deltaMs
 			}
 		}
+		fmt.Printf("P%6d @ c%6d tcp%6d tcpms%6d delta%6d: ", packetID, captureMs, ticksElapsed, tcpMs, deltaMs)
+		printPacketInfo(eth, ipv4, tcp);
 	}		
 
 	return res
@@ -320,4 +324,21 @@ func tcpTimestampToTicks(ts []byte) uint32 {
 		return 0
 	}
 	return (uint32(ts[0])<<24) | (uint32(ts[1])<<16) | (uint32(ts[2])<<8) | (uint32(ts[3])<<0)  
+}
+
+
+func printPacketInfo(eth layers.Ethernet, ipv4 layers.IPv4, tcp layers.TCP) {
+	fmt.Printf("MAC %v IP %v : %v -> ", eth.SrcMAC, ipv4.SrcIP, tcp.SrcPort)
+	fmt.Printf("MAC %v IP %v : %v ", eth.DstMAC, ipv4.DstIP, tcp.DstPort)
+	fmt.Printf("Flags")
+	if(tcp.FIN) { fmt.Printf(" FIN") }
+	if(tcp.SYN) { fmt.Printf(" SYN") }
+	if(tcp.RST) { fmt.Printf(" RST") }
+	if(tcp.PSH) { fmt.Printf(" PSH") }
+	if(tcp.ACK) { fmt.Printf(" ACK") }
+	if(tcp.URG) { fmt.Printf(" URG") }
+	if(tcp.ECE) { fmt.Printf(" ECE") }
+	if(tcp.CWR) { fmt.Printf(" CWR") }
+	if(tcp.NS)  { fmt.Printf(" NS")  }
+	fmt.Printf("\n")
 }
