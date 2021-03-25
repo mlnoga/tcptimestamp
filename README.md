@@ -8,7 +8,7 @@ A tool which hunts for TCP timestamp inconsistencies in .pcap files
 * libpcap-devel
 
 # Build
-`./build.sh` 
+`go build` 
 
 # Run 
 * Obtain the sample trace files from William
