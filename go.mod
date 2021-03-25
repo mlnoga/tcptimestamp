@@ -1,4 +1,4 @@
-module github.com/mlnoga/filterdumps
+module github.com/mlnoga/tcptimestamps
 
 go 1.9
 
