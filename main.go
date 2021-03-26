@@ -141,16 +141,17 @@ func collectStartEndTimes(fileName string) (res GlobalStats) {
 	var eth layers.Ethernet
 	var dot1q layers.Dot1Q
 	var ipv4 layers.IPv4
-	var ipv6 layers.IPv6
 	var tcp layers.TCP
 	var payload gopacket.Payload
 
-	parser  := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &dot1q, &ipv4, &ipv6, &tcp, &payload)
+	parser  := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &dot1q, &ipv4, &tcp, &payload)
 	decoded := []gopacket.LayerType{}
 
 	var packetID uint64=0
 	res.SynCountMap=map[SrcDestPair]uint32{}
 	res.ConnDataMap=map[Connection]ConnData{}
+
+	parserErrors:=map[string]bool{}
 
 	for {
 		data, ci, err := handleRead.ReadPacketData()
@@ -170,7 +171,10 @@ func collectStartEndTimes(fileName string) (res GlobalStats) {
 
 		packetID++
 		if err := parser.DecodeLayers(data, &decoded); err != nil {
-			//fmt.Fprintf(os.Stderr, "Could not decode layer: %v\n", err)
+			if parserErrors[err.Error()]==false {
+				parserErrors[err.Error()]=true
+				log.Printf("Warning: packet %6d: %s; skipping in this and all future packets\n", packetID, err)
+			}
 			continue
 		}
 
@@ -344,11 +348,10 @@ func findOutliers(fileName string, connDataMap map[Connection]ConnData, threshol
 	var eth layers.Ethernet
 	var dot1q layers.Dot1Q
 	var ipv4 layers.IPv4
-	var ipv6 layers.IPv6
 	var tcp layers.TCP
 	var payload gopacket.Payload
 
-	parser  := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &dot1q, &ipv4, &ipv6, &tcp, &payload)
+	parser  := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &dot1q, &ipv4, &tcp, &payload)
 	decoded := []gopacket.LayerType{}
 
 	synCountMap:=map[SrcDestPair]uint32{}
@@ -428,8 +431,8 @@ func findOutliers(fileName string, connDataMap map[Connection]ConnData, threshol
 			deltaMs=int64(captureMsSinceStart)-int64(tcpMsSinceStart)
 			if deltaMs>thresholdMs || deltaMs< (-thresholdMs) || cd.MsPerTCPTs<0 {
 				b.Reset()
-				fmt.Fprintf(&b,"Packet %6d @ %v tcpts %9d connSince %6d ms %7d tcpts %7d tcpms delta %7d ms: ", 
-					packetID, ci.Timestamp,  tcpTs, captureMsSinceStart, tcpTsSinceStart, tcpMsSinceStart, deltaMs)
+				fmt.Fprintf(&b,"Packet %6d @ %v tcpts %9d connSince %6d ms %7d tcpts %7d tcpms delta %7d ms synCt %02d: ", 
+					packetID, ci.Timestamp,  tcpTs, captureMsSinceStart, tcpTsSinceStart, tcpMsSinceStart, deltaMs, synCount)
 				printPacketInfo(&b, eth, ipv4, tcp);
 				log.Print(b.String())
 				numOutliers++
@@ -438,8 +441,8 @@ func findOutliers(fileName string, connDataMap map[Connection]ConnData, threshol
 
 		if !haveTCPTimestamp && cd.MsPerTCPTs<0 {
 			b.Reset()
-			fmt.Fprintf(&b,"Packet %6d @ %v tcpts MISSING   connSince %6d ms MISSING tcpms delta MISSING ms: ", 
-				packetID, ci.Timestamp,  timeDurationToMilliseconds(ci.Timestamp.Sub(cd.CaptureStart)))
+			fmt.Fprintf(&b,"Packet %6d @ %v tcpts MISSING   connSince %6d ms MISSING tcpms delta MISSING ms synCt %02d: ", 
+				packetID, ci.Timestamp,  timeDurationToMilliseconds(ci.Timestamp.Sub(cd.CaptureStart)), synCount)
 			printPacketInfo(&b, eth, ipv4, tcp);
 			log.Print(b.String())
 			numOutliers++
