@@ -126,7 +126,7 @@ func main() {
 	// Find outliers
 	fmt.Printf("\nFind Outliers\n-------------\n")
 	p2:=findOutliers(*fname, p1.ConnDataMap, *threshold)
-	fmt.Printf("Found %d outlier packet(s)\n", len(p2.PacketIDs))
+	fmt.Printf("Total %d outlier packets (%f%% of TCP packets).\n", len(p2.PacketIDs), float64(len(p2.PacketIDs))*100.0/float64(p1.PacketsTCP))
 
 	fmt.Printf("\nExiting after %v\n", time.Since(start))	
 }
@@ -294,6 +294,7 @@ func buildTimestampConversionTable(connDataMap map[Connection]ConnData) {
                ci.SynCount<cj.SynCount ) ) ) ) ) )  
 	})
 
+	numOutlierConnections:=0
 	for _,ccdp:=range(ccdps) {
 		captureDuration:=ccdp.CaptureEnd.Sub(ccdp.CaptureStart)
 		captureMs      :=captureDuration.Milliseconds()
@@ -318,13 +319,18 @@ func buildTimestampConversionTable(connDataMap map[Connection]ConnData) {
 
 		connDataMap[ccdp.Connection]=ccdp.ConnData
 
-		fmt.Printf("%3d.%3d.%3d.%3d:%5d -> %3d.%3d.%3d.%3d:%5d syn %2d: %6d packets cap start %v end %v tcpts start %9d end %d delta %7d ms %7d tcpTs %1.1f ms/tcpTs\n", 
+		// print outliers only
+		if ccdp.MsPerTCPTs<0.99 || ccdp.MsPerTCPTs>1.01 {
+			fmt.Printf("%3d.%3d.%3d.%3d:%5d -> %3d.%3d.%3d.%3d:%5d syn %2d: %6d packets cap start %v end %v tcpts start %9d end %d delta %7d ms %7d tcpTs %1.1f ms/tcpTs\n", 
 		           ccdp.SrcIP>>24, (ccdp.SrcIP>>16) & 0xff, (ccdp.SrcIP>>8) & 0xff, ccdp.SrcIP & 0xff, ccdp.SrcPort, 
 		           ccdp.DstIP>>24, (ccdp.DstIP>>16) & 0xff, (ccdp.DstIP>>8) & 0xff, ccdp.DstIP & 0xff, ccdp.DstPort, 
 		           ccdp.SynCount, ccdp.NumPackets,
 		           ccdp.CaptureStart, ccdp.CaptureEnd, ccdp.TCPTsStart, ccdp.TCPTsEnd,
 		           captureMs, tcpTsDelta, ccdp.MsPerTCPTs)
-   }
+            numOutlierConnections++
+        }
+    }
+    fmt.Printf("Total %d conversion ratio outliers (%f%% of connections)\n", numOutlierConnections, float64(numOutlierConnections)*100.0/float64(len(ccdps)))
 }
 
 
