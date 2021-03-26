@@ -11,7 +11,6 @@ A tool which hunts for TCP timestamp inconsistencies in .pcap files
 `go build` 
 
 # Run 
-* Obtain the sample trace files from William
-* Setup symlinks in traces/ 
+* `mkdir -p traces/`
+* Put or symlink the desired traces in there
 * `./run.sh`
-
