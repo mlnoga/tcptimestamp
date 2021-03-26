@@ -41,7 +41,7 @@ type Connection struct {
 }
 
 type CaptureData struct {
-	NumPackets      int32
+	NumPackets      uint32
 	NumBytes        int
 	CaptureStart	time.Time
 	CaptureEnd      time.Time
@@ -61,7 +61,7 @@ type ConnectionConnDataPair struct {
 	ConnData
 }
 
-// Results of the first analysis pass
+// Global trace analysis results
 type GlobalStats struct {
 	CaptureData
 
@@ -74,12 +74,6 @@ type GlobalStats struct {
 	SynCountMap       map[SrcDestPair]uint32
 	ConnDataMap 	  map[Connection]ConnData
 }
-
-// Results of the second analysis pass
-type findOutliersInfo struct {
-	PacketIDs         map[uint64]int64
-}
-
 
 func main() {
 	start := time.Now()
@@ -113,24 +107,24 @@ func main() {
 	// Main challenge: establish a basis to convert RFC 1323 TCP timestamps, which are only guaranteed
 	// to be proportional to wall clock time from the capture itself, on a per connection basis 
 	log.Printf("\nCollect start/end times\n-----------------------\n")
-	p1:=collectStartEndTimes(*readFileName)
+	stats:=collectStartEndTimes(*readFileName)
 
-	duration:=p1.CaptureEnd.Sub(p1.CaptureStart)
-	log.Printf("Capture covers time from  %v to %v (%v)\n",p1.CaptureStart, p1.CaptureEnd, duration)
+	duration:=stats.CaptureEnd.Sub(stats.CaptureStart)
+	log.Printf("Capture covers time from  %v to %v (%v)\n",stats.CaptureStart, stats.CaptureEnd, duration)
     log.Printf("Total %d packets of size %d at %.1f packets/second\n", 
-		p1.NumPackets, p1.NumBytes, float64(p1.NumPackets)/duration.Seconds())
+		stats.NumPackets, stats.NumBytes, float64(stats.NumPackets)/duration.Seconds())
     log.Printf("Thereof %d ethernet, %d Dot1Q, %d ipv4, %d ipv6 and %d tcp\n", 
-		p1.PacketsEthernet, p1.PacketsDot1Q, p1.PacketsIPv4, p1.PacketsIPv6, p1.PacketsTCP)
-	log.Printf("Found %d connections based on src/dst ip, src/dest port and syn count.\n", len(p1.ConnDataMap))
+		stats.PacketsEthernet, stats.PacketsDot1Q, stats.PacketsIPv4, stats.PacketsIPv6, stats.PacketsTCP)
+	log.Printf("Found %d connections based on src/dst ip, src/dest port and syn count.\n", len(stats.ConnDataMap))
 
 	// Build conversion table
 	log.Printf("\nBuild TCP timestamp/ms conversions\n----------------------------------\n")
-	buildTimestampConversionTable(p1.ConnDataMap)
+	buildTimestampConversionTable(stats.ConnDataMap)
 
 	// Find outliers
 	log.Printf("\nFind Outliers\n-------------\n")
-	p2:=findOutliers(*readFileName, p1.ConnDataMap, *threshold)
-	log.Printf("Total %d outlier packets (%f%% of TCP packets).\n", len(p2.PacketIDs), float64(len(p2.PacketIDs))*100.0/float64(p1.PacketsTCP))
+	numOutliers:=findOutliers(*readFileName, stats.ConnDataMap, *threshold)
+	log.Printf("Total %d outlier packets (%f%% of TCP packets).\n", numOutliers, float64(numOutliers)*100.0/float64(stats.PacketsTCP))
 
 	log.Printf("\nExiting after %v\n", time.Since(start).Truncate(100*time.Millisecond))	
 }
@@ -154,7 +148,7 @@ func collectStartEndTimes(fileName string) (res GlobalStats) {
 	parser  := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &dot1q, &ipv4, &ipv6, &tcp, &payload)
 	decoded := []gopacket.LayerType{}
 
-	var packetID int64=0
+	var packetID uint64=0
 	res.SynCountMap=map[SrcDestPair]uint32{}
 	res.ConnDataMap=map[Connection]ConnData{}
 
@@ -325,7 +319,7 @@ func buildTimestampConversionTable(connDataMap map[Connection]ConnData) {
 		connDataMap[ccdp.Connection]=ccdp.ConnData
 
 		// print outliers only
-		if ccdp.MsPerTCPTs<0.98 || ccdp.MsPerTCPTs>1.02 {
+		if (ccdp.MsPerTCPTs<0.98 || ccdp.MsPerTCPTs>1.02) && captureMs>500 {
 			log.Printf("%3d.%3d.%3d.%3d:%5d -> %3d.%3d.%3d.%3d:%5d syn %2d: %6d packets cap start %v end %v tcpts start %9d end %d delta %7d ms %7d tcpTs %1.2f ms/tcpTs\n", 
 		           ccdp.SrcIP>>24, (ccdp.SrcIP>>16) & 0xff, (ccdp.SrcIP>>8) & 0xff, ccdp.SrcIP & 0xff, ccdp.SrcPort, 
 		           ccdp.DstIP>>24, (ccdp.DstIP>>16) & 0xff, (ccdp.DstIP>>8) & 0xff, ccdp.DstIP & 0xff, ccdp.DstPort, 
@@ -340,7 +334,7 @@ func buildTimestampConversionTable(connDataMap map[Connection]ConnData) {
 
 
 // Find packets whose TCP timestamps differ from the wall clock by more than the expected time
-func findOutliers(fileName string, connDataMap map[Connection]ConnData, thresholdMs int64) (res findOutliersInfo) {
+func findOutliers(fileName string, connDataMap map[Connection]ConnData, thresholdMs int64) (numOutliers uint32) {
 	handleRead, err := pcap.OpenOffline(fileName)
 	if err != nil {
 		log.Fatal("Error opening PCAP file:", err)
@@ -359,7 +353,6 @@ func findOutliers(fileName string, connDataMap map[Connection]ConnData, threshol
 
 	synCountMap:=map[SrcDestPair]uint32{}
 	var packetID uint64=0
-	res.PacketIDs=map[uint64]int64{}
 
 	for {
 		data, ci, err := handleRead.ReadPacketData()
@@ -415,6 +408,9 @@ func findOutliers(fileName string, connDataMap map[Connection]ConnData, threshol
 		var tcpMsSinceStart int64
 		var captureMsSinceStart uint32
 		var deltaMs int64
+
+		var b strings.Builder
+
 		// evaluate TCP timestamp if present
 		haveTCPTimestamp:=false
 		for _,o:=range(tcp.Options) {
@@ -431,28 +427,27 @@ func findOutliers(fileName string, connDataMap map[Connection]ConnData, threshol
 			captureMsSinceStart=uint32(timeDurationToMilliseconds(ci.Timestamp.Sub(cd.CaptureStart)))
 			deltaMs=int64(captureMsSinceStart)-int64(tcpMsSinceStart)
 			if deltaMs>thresholdMs || deltaMs< (-thresholdMs) || cd.MsPerTCPTs<0 {
-				res.PacketIDs[packetID]=deltaMs
-
-				var b strings.Builder
+				b.Reset()
 				fmt.Fprintf(&b,"Packet %6d @ %v tcpts %9d connSince %6d ms %7d tcpts %7d tcpms delta %7d ms: ", 
 					packetID, ci.Timestamp,  tcpTs, captureMsSinceStart, tcpTsSinceStart, tcpMsSinceStart, deltaMs)
 				printPacketInfo(&b, eth, ipv4, tcp);
 				log.Print(b.String())
+				numOutliers++
 			}
 		}
 
 		if !haveTCPTimestamp && cd.MsPerTCPTs<0 {
-			res.PacketIDs[packetID]=999999999
-			var b strings.Builder
+			b.Reset()
 			fmt.Fprintf(&b,"Packet %6d @ %v tcpts MISSING   connSince %6d ms MISSING tcpms delta MISSING ms: ", 
 				packetID, ci.Timestamp,  timeDurationToMilliseconds(ci.Timestamp.Sub(cd.CaptureStart)))
 			printPacketInfo(&b, eth, ipv4, tcp);
 			log.Print(b.String())
+			numOutliers++
 		}
 
 	}		
 
-	return res
+	return numOutliers
 }
 
 // Creates a uint32 TCP timestamp from byte array
