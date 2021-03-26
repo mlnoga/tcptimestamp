@@ -77,7 +77,7 @@ type GlobalStats struct {
 
 // Results of the second analysis pass
 type findOutliersInfo struct {
-	PacketIDs         map[int64]int64
+	PacketIDs         map[uint64]int64
 }
 
 
@@ -149,7 +149,7 @@ func collectStartEndTimes(filename string) (res GlobalStats) {
 	parser  := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &dot1q, &ipv4, &ipv6, &tcp, &payload)
 	decoded := []gopacket.LayerType{}
 
-	var packetID int64=-1
+	var packetID int64=0
 	res.SynCountMap=map[SrcDestPair]uint32{}
 	res.ConnDataMap=map[Connection]ConnData{}
 
@@ -240,7 +240,7 @@ func collectStartEndTimes(filename string) (res GlobalStats) {
 		if(haveTCPTimestamp) {
 			// calculate conversion factor 
 			captureDuration:=ci.Timestamp.Sub(cd.CaptureStart)
-			captureMs      :=captureDuration.Milliseconds()
+			captureMs      :=timeDurationToMilliseconds(captureDuration)
 			if captureMs==0 {
 				captureMs=1
 			}
@@ -259,7 +259,7 @@ func collectStartEndTimes(filename string) (res GlobalStats) {
 
 		//if needForDebug==true {
 		//	fmt.Printf("Packet %6d @ %6dms %6dtcpts : ", 
-		//		packetID, cd.CaptureEnd.Sub(cd.CaptureStart).Milliseconds(), cd.TCPTsEnd-cd.TCPTsStart)
+		//		packetID, timeDurationToMilliseconds(cd.CaptureEnd.Sub(cd.CaptureStart)), cd.TCPTsEnd-cd.TCPTsStart)
 		//	printPacketInfo(eth, ipv4, tcp);
 		//}
 
@@ -297,7 +297,7 @@ func buildTimestampConversionTable(connDataMap map[Connection]ConnData) {
 	numOutlierConnections:=0
 	for _,ccdp:=range(ccdps) {
 		captureDuration:=ccdp.CaptureEnd.Sub(ccdp.CaptureStart)
-		captureMs      :=captureDuration.Milliseconds()
+		captureMs      :=timeDurationToMilliseconds(captureDuration)
 		if captureMs==0 {
 			captureMs=1
 		}
@@ -320,8 +320,8 @@ func buildTimestampConversionTable(connDataMap map[Connection]ConnData) {
 		connDataMap[ccdp.Connection]=ccdp.ConnData
 
 		// print outliers only
-		if ccdp.MsPerTCPTs<0.99 || ccdp.MsPerTCPTs>1.01 {
-			fmt.Printf("%3d.%3d.%3d.%3d:%5d -> %3d.%3d.%3d.%3d:%5d syn %2d: %6d packets cap start %v end %v tcpts start %9d end %d delta %7d ms %7d tcpTs %1.1f ms/tcpTs\n", 
+		if ccdp.MsPerTCPTs<0.98 || ccdp.MsPerTCPTs>1.02 {
+			fmt.Printf("%3d.%3d.%3d.%3d:%5d -> %3d.%3d.%3d.%3d:%5d syn %2d: %6d packets cap start %v end %v tcpts start %9d end %d delta %7d ms %7d tcpTs %1.2f ms/tcpTs\n", 
 		           ccdp.SrcIP>>24, (ccdp.SrcIP>>16) & 0xff, (ccdp.SrcIP>>8) & 0xff, ccdp.SrcIP & 0xff, ccdp.SrcPort, 
 		           ccdp.DstIP>>24, (ccdp.DstIP>>16) & 0xff, (ccdp.DstIP>>8) & 0xff, ccdp.DstIP & 0xff, ccdp.DstPort, 
 		           ccdp.SynCount, ccdp.NumPackets,
@@ -352,8 +352,8 @@ func findOutliers(filename string, connDataMap map[Connection]ConnData, threshol
 	decoded := []gopacket.LayerType{}
 
 	synCountMap:=map[SrcDestPair]uint32{}
-	var packetID int64=-1
-	res.PacketIDs=map[int64]int64{}
+	var packetID uint64=0
+	res.PacketIDs=map[uint64]int64{}
 
 	for {
 		data, ci, err := handleRead.ReadPacketData()
@@ -422,7 +422,7 @@ func findOutliers(filename string, connDataMap map[Connection]ConnData, threshol
 			tcpMsSinceStart=int64(float64(tcpTsSinceStart)*float64(cd.MsPerTCPTs))
 
 			// convert capture timestamp into estimated milliseconds since start of connection capture
-			captureMsSinceStart=uint32(ci.Timestamp.Sub(cd.CaptureStart).Milliseconds())
+			captureMsSinceStart=uint32(timeDurationToMilliseconds(ci.Timestamp.Sub(cd.CaptureStart)))
 			deltaMs=int64(captureMsSinceStart)-int64(tcpMsSinceStart)
 			if deltaMs>thresholdMs || deltaMs< (-thresholdMs) || cd.MsPerTCPTs<0 {
 				res.PacketIDs[packetID]=deltaMs
@@ -436,7 +436,7 @@ func findOutliers(filename string, connDataMap map[Connection]ConnData, threshol
 		if !haveTCPTimestamp && cd.MsPerTCPTs<0 {
 			res.PacketIDs[packetID]=999999999
 			fmt.Printf("Packet %6d @ %v tcpts MISSING   connSince %6d ms MISSING tcpms delta MISSING ms: ", 
-				packetID, ci.Timestamp,  ci.Timestamp.Sub(cd.CaptureStart).Milliseconds())
+				packetID, ci.Timestamp,  timeDurationToMilliseconds(ci.Timestamp.Sub(cd.CaptureStart)))
 			printPacketInfo(eth, ipv4, tcp);
 		}
 
@@ -486,4 +486,8 @@ func printPacketInfo(eth layers.Ethernet, ipv4 layers.IPv4, tcp layers.TCP) {
 	if(tcp.CWR) { fmt.Printf(" CWR") }
 	if(tcp.NS)  { fmt.Printf(" NS")  }
 	fmt.Printf("\n")
+}
+
+func timeDurationToMilliseconds(d time.Duration) int64 {
+	return d.Nanoseconds()/1000000
 }
