@@ -8,24 +8,24 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"io"
 	"log"
+	"fmt"
 	"os"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/google/gopacket"
-	"github.com/google/gopacket/examples/util"
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/layers"
 )
 
 
-var fname     = flag.String("r", "", "Filename to read the pcap network capture from")
-var srcip     = flag.String("i", "", "Source IP address to filter for")
-var threshold = flag.Int64("t", 2000, "Theshold in ms for max acceptable difference between capture and TCP timestamps")
+var readFileName          = flag.String("r", "",    "Filename for input PCAP file")
+var writeFileName         = flag.String("w", "",    "Filename for output analysis file. Overrides potential filename generation")
+var generateWriteFileName = flag.Bool  ("g", false, "Generate output file by appending .analysis to the input filename")
+var threshold             = flag.Int64 ("t", 5000,  "Theshold in ms for max acceptable difference between capture and TCP timestamps")
 
 
 type SrcDestPair struct {
@@ -83,61 +83,66 @@ type findOutliersInfo struct {
 
 func main() {
 	start := time.Now()
-	defer util.Run()()
+	flag.Parse()
+	log.SetFlags(0)
+
+	// redirect output to file if required
+	theWriteFileName:=*writeFileName
+	if theWriteFileName=="" && *generateWriteFileName {
+		theWriteFileName=*readFileName + ".analysis"
+	}
+	if theWriteFileName!="" {
+		writer, err:=os.Create(theWriteFileName)
+		if err!=nil {
+			log.Fatalf("Error opening output file %s: %s", theWriteFileName, err)
+		}		
+		log.SetOutput(writer)
+		flag.CommandLine.SetOutput(writer)
+	}
 
 	// Sanity checks
-	if *fname == "" {
-		log.Fatal("Need an input file")
+	if *readFileName == "" {
+		log.Printf("Usage: tcptimestamps [-flags]")
+		flag.PrintDefaults();
+		log.Fatal("Fatal: Need an input file")
 	}
 
-	// Open PCAP file + handle potential BPF Filter
-	handleRead, err := pcap.OpenOffline(*fname)
-	if err != nil {
-		log.Fatal("PCAP OpenOffline error (handle to read packet):", err)
-	}
-	defer handleRead.Close()
-	if len(flag.Args()) > 0 {
-		bpffilter := strings.Join(flag.Args(), " ")
-		fmt.Fprintf(os.Stderr, "Using BPF filter %q\n", bpffilter)
-		if err = handleRead.SetBPFFilter(bpffilter); err != nil {
-			log.Fatal("BPF filter error:", err)
-		}
-	}
-
-	fmt.Printf("Scanning trace file %s\n", *fname)
+	// Open PCAP file
+	log.Printf("Scanning trace file %s\n", *readFileName)
 
 	// Main challenge: establish a basis to convert RFC 1323 TCP timestamps, which are only guaranteed
 	// to be proportional to wall clock time from the capture itself, on a per connection basis 
-	fmt.Printf("\nCollect start/end times\n-----------------------\n")
-	p1:=collectStartEndTimes(*fname)
+	log.Printf("\nCollect start/end times\n-----------------------\n")
+	p1:=collectStartEndTimes(*readFileName)
 
 	duration:=p1.CaptureEnd.Sub(p1.CaptureStart)
-	fmt.Printf("Capture covers time from  %v to %v (%v)\n",p1.CaptureStart, p1.CaptureEnd, duration)
-    fmt.Printf("Total %d packets of size %d at %.1f packets/second\n", 
+	log.Printf("Capture covers time from  %v to %v (%v)\n",p1.CaptureStart, p1.CaptureEnd, duration)
+    log.Printf("Total %d packets of size %d at %.1f packets/second\n", 
 		p1.NumPackets, p1.NumBytes, float64(p1.NumPackets)/duration.Seconds())
-    fmt.Printf("Thereof %d ethernet, %d Dot1Q, %d ipv4, %d ipv6 and %d tcp\n", 
+    log.Printf("Thereof %d ethernet, %d Dot1Q, %d ipv4, %d ipv6 and %d tcp\n", 
 		p1.PacketsEthernet, p1.PacketsDot1Q, p1.PacketsIPv4, p1.PacketsIPv6, p1.PacketsTCP)
-	fmt.Printf("Found %d connections based on src/dst ip, src/dest port and syn count.\n", len(p1.ConnDataMap))
+	log.Printf("Found %d connections based on src/dst ip, src/dest port and syn count.\n", len(p1.ConnDataMap))
 
 	// Build conversion table
-	fmt.Printf("\nBuild TCP timestamp/ms conversions\n----------------------------------\n")
+	log.Printf("\nBuild TCP timestamp/ms conversions\n----------------------------------\n")
 	buildTimestampConversionTable(p1.ConnDataMap)
 
 	// Find outliers
-	fmt.Printf("\nFind Outliers\n-------------\n")
-	p2:=findOutliers(*fname, p1.ConnDataMap, *threshold)
-	fmt.Printf("Total %d outlier packets (%f%% of TCP packets).\n", len(p2.PacketIDs), float64(len(p2.PacketIDs))*100.0/float64(p1.PacketsTCP))
+	log.Printf("\nFind Outliers\n-------------\n")
+	p2:=findOutliers(*readFileName, p1.ConnDataMap, *threshold)
+	log.Printf("Total %d outlier packets (%f%% of TCP packets).\n", len(p2.PacketIDs), float64(len(p2.PacketIDs))*100.0/float64(p1.PacketsTCP))
 
-	fmt.Printf("\nExiting after %v\n", time.Since(start))	
+	log.Printf("\nExiting after %v\n", time.Since(start).Truncate(100*time.Millisecond))	
 }
 
 
 // Find connections and collect wall clock and TCP timestamp start and end times per connection
-func collectStartEndTimes(filename string) (res GlobalStats) {
-	handleRead, err := pcap.OpenOffline(*fname)
+func collectStartEndTimes(fileName string) (res GlobalStats) {
+	handleRead, err := pcap.OpenOffline(fileName)
 	if err != nil {
-		log.Fatal("PCAP OpenOffline error (handle to read packet):", err)
+		log.Fatal("Error opening PCAP file:", err)
 	}
+	defer handleRead.Close()
 
 	var eth layers.Ethernet
 	var dot1q layers.Dot1Q
@@ -258,7 +263,7 @@ func collectStartEndTimes(filename string) (res GlobalStats) {
 		}
 
 		//if needForDebug==true {
-		//	fmt.Printf("Packet %6d @ %6dms %6dtcpts : ", 
+		//	log.Printf("Packet %6d @ %6dms %6dtcpts : ", 
 		//		packetID, timeDurationToMilliseconds(cd.CaptureEnd.Sub(cd.CaptureStart)), cd.TCPTsEnd-cd.TCPTsStart)
 		//	printPacketInfo(eth, ipv4, tcp);
 		//}
@@ -321,7 +326,7 @@ func buildTimestampConversionTable(connDataMap map[Connection]ConnData) {
 
 		// print outliers only
 		if ccdp.MsPerTCPTs<0.98 || ccdp.MsPerTCPTs>1.02 {
-			fmt.Printf("%3d.%3d.%3d.%3d:%5d -> %3d.%3d.%3d.%3d:%5d syn %2d: %6d packets cap start %v end %v tcpts start %9d end %d delta %7d ms %7d tcpTs %1.2f ms/tcpTs\n", 
+			log.Printf("%3d.%3d.%3d.%3d:%5d -> %3d.%3d.%3d.%3d:%5d syn %2d: %6d packets cap start %v end %v tcpts start %9d end %d delta %7d ms %7d tcpTs %1.2f ms/tcpTs\n", 
 		           ccdp.SrcIP>>24, (ccdp.SrcIP>>16) & 0xff, (ccdp.SrcIP>>8) & 0xff, ccdp.SrcIP & 0xff, ccdp.SrcPort, 
 		           ccdp.DstIP>>24, (ccdp.DstIP>>16) & 0xff, (ccdp.DstIP>>8) & 0xff, ccdp.DstIP & 0xff, ccdp.DstPort, 
 		           ccdp.SynCount, ccdp.NumPackets,
@@ -330,16 +335,17 @@ func buildTimestampConversionTable(connDataMap map[Connection]ConnData) {
             numOutlierConnections++
         }
     }
-    fmt.Printf("Total %d conversion ratio outliers (%f%% of connections)\n", numOutlierConnections, float64(numOutlierConnections)*100.0/float64(len(ccdps)))
+    log.Printf("Total %d conversion ratio outliers (%f%% of connections)\n", numOutlierConnections, float64(numOutlierConnections)*100.0/float64(len(ccdps)))
 }
 
 
 // Find packets whose TCP timestamps differ from the wall clock by more than the expected time
-func findOutliers(filename string, connDataMap map[Connection]ConnData, thresholdMs int64) (res findOutliersInfo) {
-	handleRead, err := pcap.OpenOffline(*fname)
+func findOutliers(fileName string, connDataMap map[Connection]ConnData, thresholdMs int64) (res findOutliersInfo) {
+	handleRead, err := pcap.OpenOffline(fileName)
 	if err != nil {
-		log.Fatal("PCAP OpenOffline error (handle to read packet):", err)
+		log.Fatal("Error opening PCAP file:", err)
 	}
+	defer handleRead.Close()
 
 	var eth layers.Ethernet
 	var dot1q layers.Dot1Q
@@ -427,17 +433,21 @@ func findOutliers(filename string, connDataMap map[Connection]ConnData, threshol
 			if deltaMs>thresholdMs || deltaMs< (-thresholdMs) || cd.MsPerTCPTs<0 {
 				res.PacketIDs[packetID]=deltaMs
 
-				fmt.Printf("Packet %6d @ %v tcpts %9d connSince %6d ms %7d tcpts %7d tcpms delta %7d ms: ", 
+				var b strings.Builder
+				fmt.Fprintf(&b,"Packet %6d @ %v tcpts %9d connSince %6d ms %7d tcpts %7d tcpms delta %7d ms: ", 
 					packetID, ci.Timestamp,  tcpTs, captureMsSinceStart, tcpTsSinceStart, tcpMsSinceStart, deltaMs)
-				printPacketInfo(eth, ipv4, tcp);
+				printPacketInfo(&b, eth, ipv4, tcp);
+				log.Print(b.String())
 			}
 		}
 
 		if !haveTCPTimestamp && cd.MsPerTCPTs<0 {
 			res.PacketIDs[packetID]=999999999
-			fmt.Printf("Packet %6d @ %v tcpts MISSING   connSince %6d ms MISSING tcpms delta MISSING ms: ", 
+			var b strings.Builder
+			fmt.Fprintf(&b,"Packet %6d @ %v tcpts MISSING   connSince %6d ms MISSING tcpms delta MISSING ms: ", 
 				packetID, ci.Timestamp,  timeDurationToMilliseconds(ci.Timestamp.Sub(cd.CaptureStart)))
-			printPacketInfo(eth, ipv4, tcp);
+			printPacketInfo(&b, eth, ipv4, tcp);
+			log.Print(b.String())
 		}
 
 	}		
@@ -472,20 +482,19 @@ func ipToUInt32(ts []byte) uint32 {
 }
 
 // Pretty prints a packet
-func printPacketInfo(eth layers.Ethernet, ipv4 layers.IPv4, tcp layers.TCP) {
-	fmt.Printf("[%v] %v:%v -> ", eth.SrcMAC, ipv4.SrcIP, tcp.SrcPort)
-	fmt.Printf("%v:%v [%v]", ipv4.DstIP, tcp.DstPort, eth.DstMAC)
-	fmt.Printf(" Seq %d Flags", tcp.Seq)
-	if(tcp.FIN) { fmt.Printf(" FIN") }
-	if(tcp.SYN) { fmt.Printf(" SYN") }
-	if(tcp.RST) { fmt.Printf(" RST") }
-	if(tcp.PSH) { fmt.Printf(" PSH") }
-	if(tcp.ACK) { fmt.Printf(" ACK") }
-	if(tcp.URG) { fmt.Printf(" URG") }
-	if(tcp.ECE) { fmt.Printf(" ECE") }
-	if(tcp.CWR) { fmt.Printf(" CWR") }
-	if(tcp.NS)  { fmt.Printf(" NS")  }
-	fmt.Printf("\n")
+func printPacketInfo(b io.Writer, eth layers.Ethernet, ipv4 layers.IPv4, tcp layers.TCP) {
+	fmt.Fprintf(b, "[%v] %v:%v -> ", eth.SrcMAC, ipv4.SrcIP, tcp.SrcPort)
+	fmt.Fprintf(b, "%v:%v [%v]", ipv4.DstIP, tcp.DstPort, eth.DstMAC)
+	fmt.Fprintf(b, " Seq %d Flags", tcp.Seq)
+	if(tcp.FIN) { fmt.Fprintf(b, " FIN") }
+	if(tcp.SYN) { fmt.Fprintf(b, " SYN") }
+	if(tcp.RST) { fmt.Fprintf(b, " RST") }
+	if(tcp.PSH) { fmt.Fprintf(b, " PSH") }
+	if(tcp.ACK) { fmt.Fprintf(b, " ACK") }
+	if(tcp.URG) { fmt.Fprintf(b, " URG") }
+	if(tcp.ECE) { fmt.Fprintf(b, " ECE") }
+	if(tcp.CWR) { fmt.Fprintf(b, " CWR") }
+	if(tcp.NS)  { fmt.Fprintf(b, " NS")  }
 }
 
 func timeDurationToMilliseconds(d time.Duration) int64 {
