@@ -52,7 +52,8 @@ type ConnData struct {
 
 	TCPTsStart      uint32
 	TCPTsEnd        uint32
-	MsPerTCPTs      float32
+	MsPerTCPTs      float32      // conversion factor. contains sum during initial data gathering
+	MsPerTCPTsCount int32        // during initial data gathering, contains divider which turns sum into average
 }
 
 type ConnectionConnDataPair struct {
@@ -224,6 +225,7 @@ func collectStartEndTimes(filename string) (res GlobalStats) {
 		cd.NumBytes  += len(data)
 
 		// evaluate TCP timestamp if present
+		haveTCPTimestamp:=false
 		for _,o:=range(tcp.Options) {
 			if o.OptionType!=8 {  
 				continue;
@@ -232,6 +234,27 @@ func collectStartEndTimes(filename string) (res GlobalStats) {
 				cd.TCPTsStart=tcpTimestampFromBytes(o.OptionData)
 			}
 			cd.TCPTsEnd=tcpTimestampFromBytes(o.OptionData)
+			haveTCPTimestamp=true;
+		}
+
+		if(haveTCPTimestamp) {
+			// calculate conversion factor 
+			captureDuration:=ci.Timestamp.Sub(cd.CaptureStart)
+			captureMs      :=captureDuration.Milliseconds()
+			if captureMs==0 {
+				captureMs=1
+			}
+
+			tcpTsDelta     :=tcpTimestampDelta(cd.TCPTsStart, cd.TCPTsEnd)
+			if tcpTsDelta==0 {
+				tcpTsDelta=1
+			}
+
+			thisMsPerTCPTs:=float32(float64(captureMs)/float64(tcpTsDelta))
+
+			// update running average for this connection
+			cd.MsPerTCPTs+=thisMsPerTCPTs
+			cd.MsPerTCPTsCount++
 		}
 
 		//if needForDebug==true {
@@ -283,7 +306,9 @@ func buildTimestampConversionTable(connDataMap map[Connection]ConnData) {
 			tcpTsDelta=1
 		}
 
-		ccdp.MsPerTCPTs   =float32(float64(captureMs)/float64(tcpTsDelta))
+		ccdp.MsPerTCPTs/=float32(ccdp.MsPerTCPTsCount)
+		ccdp.MsPerTCPTsCount=1
+		//ccdp.MsPerTCPTs   =float32(float64(captureMs)/float64(tcpTsDelta))
 		if ccdp.MsPerTCPTs>0 && ccdp.MsPerTCPTs<1 {
 			ccdp.MsPerTCPTs=1	
 		}
@@ -393,11 +418,11 @@ func findOutliers(filename string, connDataMap map[Connection]ConnData, threshol
 			// convert capture timestamp into estimated milliseconds since start of connection capture
 			captureMsSinceStart=uint32(ci.Timestamp.Sub(cd.CaptureStart).Milliseconds())
 			deltaMs=int64(captureMsSinceStart)-int64(tcpMsSinceStart)
-			if deltaMs>thresholdMs || cd.MsPerTCPTs<0 {
+			if deltaMs>thresholdMs || deltaMs< (-thresholdMs) || cd.MsPerTCPTs<0 {
 				res.PacketIDs[packetID]=deltaMs
 
-				fmt.Printf("Packet %6d @ %v tcpts %9d connSince %6d ms %7d tcpms delta %7d ms: ", 
-					packetID, ci.Timestamp,  tcpTs, captureMsSinceStart, tcpMsSinceStart, deltaMs)
+				fmt.Printf("Packet %6d @ %v tcpts %9d connSince %6d ms %7d tcpts %7d tcpms delta %7d ms: ", 
+					packetID, ci.Timestamp,  tcpTs, captureMsSinceStart, tcpTsSinceStart, tcpMsSinceStart, deltaMs)
 				printPacketInfo(eth, ipv4, tcp);
 			}
 		}
