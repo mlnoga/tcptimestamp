@@ -86,7 +86,7 @@ func main() {
 
 	// Sanity checks
 	if *fname == "" {
-		log.Fatal("Need a input file")
+		log.Fatal("Need an input file")
 	}
 
 	// Open PCAP file + handle potential BPF Filter
@@ -120,87 +120,18 @@ func main() {
 
 	// Build conversion table
 	fmt.Printf("\nBuild TCP timestamp/ms conversions\n----------------------------------\n")
-	ccdps:=make([]ConnectionConnDataPair, 0, len(p1.ConnDataMap))
-	for conn,cd := range(p1.ConnDataMap) {
-		ccdp:=ConnectionConnDataPair{
-			Connection:conn,
-			ConnData  :cd,
-		}
-		ccdps=append(ccdps, ccdp)
-	}
+	buildTimestampConversionTable(p1.ConnDataMap)
 
-	sort.Slice(ccdps, func(i, j int) bool {
-		ci:=ccdps[i]
-		cj:=ccdps[j]
-		return ci.SrcIP<cj.SrcIP || 
-		     ( ci.SrcIP==cj.SrcIP && (
-               ci.SrcPort<cj.SrcPort || (
-               ci.SrcPort==cj.SrcPort && (
-               ci.DstIP<cj.DstIP || (
-               ci.DstPort<cj.DstPort ||  (
-               ci.DstPort==cj.DstPort &&
-               ci.SynCount<cj.SynCount ) ) ) ) ) )  
-	})
-
-	for _,ccdp:=range(ccdps) {
-		captureDuration:=ccdp.CaptureEnd.Sub(ccdp.CaptureStart)
-		captureMs      :=captureDuration.Milliseconds()
-		if captureMs==0 {
-			captureMs=1
-		}
-
-		tcpTsDelta     :=int64(ccdp.TCPTsEnd)
-		if (ccdp.TCPTsEnd<ccdp.TCPTsStart) && ((ccdp.TCPTsEnd-ccdp.TCPTsStart)<(uint32(1)<<31)) {
-			tcpTsDelta+=int64(1)<<32
-		}
-		tcpTsDelta-=int64(ccdp.TCPTsStart)
-		if tcpTsDelta==0 {
-			tcpTsDelta=1
-		}
-
-		ccdp.MsPerTCPTs   =float32(float64(captureMs)/float64(tcpTsDelta))
-		if ccdp.MsPerTCPTs>0 && ccdp.MsPerTCPTs<1 {
-			ccdp.MsPerTCPTs=1	
-		}
-		if ccdp.MsPerTCPTs<0 && ccdp.MsPerTCPTs>-1 {
-			ccdp.MsPerTCPTs=-1	
-		}
-
-		p1.ConnDataMap[ccdp.Connection]=ccdp.ConnData
-
-		fmt.Printf("%3d.%3d.%3d.%3d:%5d -> %3d.%3d.%3d.%3d:%5d syn %2d: %6d packets cap start %v end %v tcpts start %9d end %d delta %7d ms %7d tcpTs %1.1f ms/tcpTs\n", 
-		           ccdp.SrcIP>>24, (ccdp.SrcIP>>16) & 0xff, (ccdp.SrcIP>>8) & 0xff, ccdp.SrcIP & 0xff, ccdp.SrcPort, 
-		           ccdp.DstIP>>24, (ccdp.DstIP>>16) & 0xff, (ccdp.DstIP>>8) & 0xff, ccdp.DstIP & 0xff, ccdp.DstPort, 
-		           ccdp.SynCount, ccdp.NumPackets,
-		           ccdp.CaptureStart, ccdp.CaptureEnd, ccdp.TCPTsStart, ccdp.TCPTsEnd,
-		           captureMs, tcpTsDelta, ccdp.MsPerTCPTs)
-   }
-
-	// Run second analysis pass
-	//
+	// Find outliers
 	fmt.Printf("\nFind Outliers\n-------------\n")
 	p2:=findOutliers(*fname, p1.ConnDataMap, *threshold)
-
 	fmt.Printf("Found %d outlier packet(s)\n", len(p2.PacketIDs))
-
-	/*
-	// sort keys by ascending packet ID
-	packetIDs := make([]int, 0, len(p2.PacketIDs))
-	for packetID := range p2.PacketIDs {
-		packetIDs = append(packetIDs, int(packetID))
-	}
-	sort.Ints(packetIDs)
-
-	for _,packetID := range(packetIDs) {
-		fmt.Printf("%8d [%6dms]\n", packetID, p2.PacketIDs[int64(packetID)])
-	}
-	*/
 
 	fmt.Printf("\nExiting after %v\n", time.Since(start))	
 }
 
 
-// The first analysis pass determines timings and the conversion factor from TCP timestamps to capture times
+// Find connections and collect wall clock and TCP timestamp start and end times per connection
 func collectStartEndTimes(filename string) (res GlobalStats) {
 	handleRead, err := pcap.OpenOffline(*fname)
 	if err != nil {
@@ -298,9 +229,9 @@ func collectStartEndTimes(filename string) (res GlobalStats) {
 				continue;
 			} 
 			if cd.NumPackets<=1 {
-				cd.TCPTsStart=tcpTimestampToTicks(o.OptionData)
+				cd.TCPTsStart=tcpTimestampFromBytes(o.OptionData)
 			}
-			cd.TCPTsEnd=tcpTimestampToTicks(o.OptionData)
+			cd.TCPTsEnd=tcpTimestampFromBytes(o.OptionData)
 		}
 
 		//if needForDebug==true {
@@ -316,7 +247,63 @@ func collectStartEndTimes(filename string) (res GlobalStats) {
 }
 
 
-// The second analysis pass finds packets whose TCP timestamps differ from the wall clock by more than the expected time
+// Calculates conversion factors from TCP timestamps to capture time milliseconds for each connection, storing them in the map provided  
+func buildTimestampConversionTable(connDataMap map[Connection]ConnData) {
+	ccdps:=make([]ConnectionConnDataPair, 0, len(connDataMap))
+	for conn,cd := range(connDataMap) {
+		ccdp:=ConnectionConnDataPair{
+			Connection:conn,
+			ConnData  :cd,
+		}
+		ccdps=append(ccdps, ccdp)
+	}
+
+	sort.Slice(ccdps, func(i, j int) bool {
+		ci:=ccdps[i]
+		cj:=ccdps[j]
+		return ci.SrcIP<cj.SrcIP || 
+		     ( ci.SrcIP==cj.SrcIP && (
+               ci.SrcPort<cj.SrcPort || (
+               ci.SrcPort==cj.SrcPort && (
+               ci.DstIP<cj.DstIP || (
+               ci.DstPort<cj.DstPort ||  (
+               ci.DstPort==cj.DstPort &&
+               ci.SynCount<cj.SynCount ) ) ) ) ) )  
+	})
+
+	for _,ccdp:=range(ccdps) {
+		captureDuration:=ccdp.CaptureEnd.Sub(ccdp.CaptureStart)
+		captureMs      :=captureDuration.Milliseconds()
+		if captureMs==0 {
+			captureMs=1
+		}
+
+		tcpTsDelta     :=tcpTimestampDelta(ccdp.TCPTsStart, ccdp.TCPTsEnd)
+		if tcpTsDelta==0 {
+			tcpTsDelta=1
+		}
+
+		ccdp.MsPerTCPTs   =float32(float64(captureMs)/float64(tcpTsDelta))
+		if ccdp.MsPerTCPTs>0 && ccdp.MsPerTCPTs<1 {
+			ccdp.MsPerTCPTs=1	
+		}
+		if ccdp.MsPerTCPTs<0 && ccdp.MsPerTCPTs>-1 {
+			ccdp.MsPerTCPTs=-1	
+		}
+
+		connDataMap[ccdp.Connection]=ccdp.ConnData
+
+		fmt.Printf("%3d.%3d.%3d.%3d:%5d -> %3d.%3d.%3d.%3d:%5d syn %2d: %6d packets cap start %v end %v tcpts start %9d end %d delta %7d ms %7d tcpTs %1.1f ms/tcpTs\n", 
+		           ccdp.SrcIP>>24, (ccdp.SrcIP>>16) & 0xff, (ccdp.SrcIP>>8) & 0xff, ccdp.SrcIP & 0xff, ccdp.SrcPort, 
+		           ccdp.DstIP>>24, (ccdp.DstIP>>16) & 0xff, (ccdp.DstIP>>8) & 0xff, ccdp.DstIP & 0xff, ccdp.DstPort, 
+		           ccdp.SynCount, ccdp.NumPackets,
+		           ccdp.CaptureStart, ccdp.CaptureEnd, ccdp.TCPTsStart, ccdp.TCPTsEnd,
+		           captureMs, tcpTsDelta, ccdp.MsPerTCPTs)
+   }
+}
+
+
+// Find packets whose TCP timestamps differ from the wall clock by more than the expected time
 func findOutliers(filename string, connDataMap map[Connection]ConnData, thresholdMs int64) (res findOutliersInfo) {
 	handleRead, err := pcap.OpenOffline(*fname)
 	if err != nil {
@@ -387,8 +374,8 @@ func findOutliers(filename string, connDataMap map[Connection]ConnData, threshol
 		}
 		cd:=connDataMap[conn]
 
-		var tcpTsSinceStart uint32
-		var tcpMsSinceStart uint32
+		var tcpTsSinceStart int64
+		var tcpMsSinceStart int64
 		var captureMsSinceStart uint32
 		var deltaMs int64
 		// evaluate TCP timestamp if present
@@ -399,9 +386,9 @@ func findOutliers(filename string, connDataMap map[Connection]ConnData, threshol
 			} 
 			haveTCPTimestamp=true
 			// convert TCP timestamp into equivalent milliseconds since start of connection capture
-			tcpTs         :=tcpTimestampToTicks(o.OptionData)
-			tcpTsSinceStart=tcpTs - cd.TCPTsStart
-			tcpMsSinceStart=uint32(float64(tcpTsSinceStart)*float64(cd.MsPerTCPTs))
+			tcpTs         :=tcpTimestampFromBytes(o.OptionData)
+			tcpTsSinceStart=tcpTimestampDelta(cd.TCPTsStart, tcpTs)
+			tcpMsSinceStart=int64(float64(tcpTsSinceStart)*float64(cd.MsPerTCPTs))
 
 			// convert capture timestamp into estimated milliseconds since start of connection capture
 			captureMsSinceStart=uint32(ci.Timestamp.Sub(cd.CaptureStart).Milliseconds())
@@ -427,12 +414,22 @@ func findOutliers(filename string, connDataMap map[Connection]ConnData, threshol
 	return res
 }
 
-// Converts given TCP timestamp to uncalibrated ticks
-func tcpTimestampToTicks(ts []byte) uint32 {
+// Creates a uint32 TCP timestamp from byte array
+func tcpTimestampFromBytes(ts []byte) uint32 {
 	if len(ts)!=8 {
 		return 0
 	}
 	return (uint32(ts[0])<<24) | (uint32(ts[1])<<16) | (uint32(ts[2])<<8) | (uint32(ts[3])<<0)  
+}
+
+// Calculates signed difference between TCP timestamps, keeping in mind the wraparound logic from https://tools.ietf.org/html/rfc7323#page-11
+func tcpTimestampDelta(start, end uint32) int64 {
+	delta     :=int64(end)
+	if (end<start) && ((end-start)<(uint32(1)<<31)) {
+		delta +=int64(1)<<32
+	}
+	delta     -=int64(start)
+	return delta
 }
 
 // Converts given IP address to uint32
@@ -443,7 +440,7 @@ func ipToUInt32(ts []byte) uint32 {
 	return (uint32(ts[0])<<24) | (uint32(ts[1])<<16) | (uint32(ts[2])<<8) | (uint32(ts[3])<<0)  
 }
 
-
+// Pretty prints a packet
 func printPacketInfo(eth layers.Ethernet, ipv4 layers.IPv4, tcp layers.TCP) {
 	fmt.Printf("[%v] %v:%v -> ", eth.SrcMAC, ipv4.SrcIP, tcp.SrcPort)
 	fmt.Printf("%v:%v [%v]", ipv4.DstIP, tcp.DstPort, eth.DstMAC)
