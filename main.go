@@ -344,7 +344,7 @@ func buildTimestampConversionTable(connDataMap map[Connection]ConnData) {
 			(ccdp.MsPerTCPTs>=0.97 && ccdp.MsPerTCPTs<=1.03) ||
 			(ccdp.MsPerTCPTs>=3.97 && ccdp.MsPerTCPTs<=4.03)    ) && !(ccdp.MsOffset>=-1 && ccdp.MsOffset<=1)  {
             numOutlierConnections++
-			log.Printf("Conn %4d: %3d.%3d.%3d.%3d:%5d -> %3d.%3d.%3d.%3d:%5d syn %2d: %6d packets cap start %v end %v tcpts start %9d end %d delta %7d ms %7d tcpTs ms=%1.2f tcp %+1.2f\n", 
+			log.Printf("Conn %4d: %3d.%3d.%3d.%3d:%5d -> %3d.%3d.%3d.%3d:%5d syn %2d: %6d packets cap start %v end %v tcpts start %9d end %d delta %7d ms %7d tcpTs ms=%1.2fx tcpts %+1.2f\n", 
 		           c,
 		           ccdp.SrcIP>>24, (ccdp.SrcIP>>16) & 0xff, (ccdp.SrcIP>>8) & 0xff, ccdp.SrcIP & 0xff, ccdp.SrcPort, 
 		           ccdp.DstIP>>24, (ccdp.DstIP>>16) & 0xff, (ccdp.DstIP>>8) & 0xff, ccdp.DstIP & 0xff, ccdp.DstPort, 
