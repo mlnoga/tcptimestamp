@@ -19,6 +19,8 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/layers"
+
+	"github.com/valyala/fastrand"
 )
 
 
@@ -47,13 +49,20 @@ type CaptureData struct {
 	CaptureEnd      time.Time
 }
 
+type TimingPair struct {
+	Capture 	 time.Time
+	TCPTimestamp uint32
+}
+
 type ConnData struct {
 	CaptureData
 
 	TCPTsStart      uint32
 	TCPTsEnd        uint32
-	MsPerTCPTs      float32      // conversion factor. contains sum during initial data gathering
-	MsPerTCPTsCount int32        // during initial data gathering, contains divider which turns sum into average
+
+	TimingPairs   []TimingPair   // for calculation of conversion factor. nil'ed afterwards to free memory
+	MsPerTCPTs      float32      // conversion factor
+	MsOffset        float32      // offset factor
 }
 
 type ConnectionConnDataPair struct {
@@ -68,17 +77,21 @@ type GlobalStats struct {
 	PacketsEthernet   int
 	PacketsDot1Q      int
 	PacketsIPv4       int
-	PacketsIPv6       int
 	PacketsTCP        int
 
 	SynCountMap       map[SrcDestPair]uint32
 	ConnDataMap 	  map[Connection]ConnData
 }
 
+
+var rng = fastrand.RNG{}
+
+
 func main() {
 	start := time.Now()
 	flag.Parse()
 	log.SetFlags(0)
+
 
 	// redirect output to file if required
 	theWriteFileName:=*writeFileName
@@ -113,8 +126,8 @@ func main() {
 	log.Printf("Capture covers time from  %v to %v (%v)\n",stats.CaptureStart, stats.CaptureEnd, duration)
     log.Printf("Total %d packets of size %d at %.1f packets/second\n", 
 		stats.NumPackets, stats.NumBytes, float64(stats.NumPackets)/duration.Seconds())
-    log.Printf("Thereof %d ethernet, %d Dot1Q, %d ipv4, %d ipv6 and %d tcp\n", 
-		stats.PacketsEthernet, stats.PacketsDot1Q, stats.PacketsIPv4, stats.PacketsIPv6, stats.PacketsTCP)
+    log.Printf("Thereof %d ethernet, %d Dot1Q, %d ipv4 and %d tcp\n", 
+		stats.PacketsEthernet, stats.PacketsDot1Q, stats.PacketsIPv4, stats.PacketsTCP)
 	log.Printf("Found %d connections based on src/dst ip, src/dest port and syn count.\n", len(stats.ConnDataMap))
 
 	// Build conversion table
@@ -123,14 +136,13 @@ func main() {
 
 	// Find outliers
 	log.Printf("\nFind Outliers\n-------------\n")
-	numOutliers:=findOutliers(*readFileName, stats.ConnDataMap, *threshold)
-	log.Printf("Total %d outlier packets (%f%% of TCP packets).\n", numOutliers, float64(numOutliers)*100.0/float64(stats.PacketsTCP))
+	findOutliers(*readFileName, stats.ConnDataMap, *threshold)
 
 	log.Printf("\nExiting after %v\n", time.Since(start).Truncate(100*time.Millisecond))	
 }
 
 
-// Find connections and collect wall clock and TCP timestamp start and end times per connection
+// Find connections and collect wall clock and TCP timestamps per connection
 func collectStartEndTimes(fileName string) (res GlobalStats) {
 	handleRead, err := pcap.OpenOffline(fileName)
 	if err != nil {
@@ -151,7 +163,8 @@ func collectStartEndTimes(fileName string) (res GlobalStats) {
 	res.SynCountMap=map[SrcDestPair]uint32{}
 	res.ConnDataMap=map[Connection]ConnData{}
 
-	parserErrors:=map[string]bool{}
+	parserErrors:=map[string]uint32{}
+	// var b strings.Builder
 
 	for {
 		data, ci, err := handleRead.ReadPacketData()
@@ -171,10 +184,10 @@ func collectStartEndTimes(fileName string) (res GlobalStats) {
 
 		packetID++
 		if err := parser.DecodeLayers(data, &decoded); err != nil {
-			if parserErrors[err.Error()]==false {
-				parserErrors[err.Error()]=true
+			if parserErrors[err.Error()]==0 {
 				log.Printf("Warning: packet %6d: %s; skipping in this and all future packets\n", packetID, err)
 			}
+			parserErrors[err.Error()]++
 			continue
 		}
 
@@ -189,8 +202,6 @@ func collectStartEndTimes(fileName string) (res GlobalStats) {
 			case layers.LayerTypeIPv4:
 				res.PacketsIPv4++
 				haveIPv4=true
-			case layers.LayerTypeIPv6:
-				res.PacketsIPv6++
 			case layers.LayerTypeTCP:
 			  	res.PacketsTCP++
 			  	haveTCP=true
@@ -228,46 +239,46 @@ func collectStartEndTimes(fileName string) (res GlobalStats) {
 		cd.NumBytes  += len(data)
 
 		// evaluate TCP timestamp if present
-		haveTCPTimestamp:=false
 		for _,o:=range(tcp.Options) {
 			if o.OptionType!=8 {  
 				continue;
 			} 
+			tcpTimestamp:=tcpTimestampFromBytes(o.OptionData)
 			if cd.NumPackets<=1 {
-				cd.TCPTsStart=tcpTimestampFromBytes(o.OptionData)
+				cd.TCPTsStart=tcpTimestamp
 			}
-			cd.TCPTsEnd=tcpTimestampFromBytes(o.OptionData)
-			haveTCPTimestamp=true;
+			cd.TCPTsEnd=tcpTimestamp
+
+			tp:=TimingPair{ Capture:ci.Timestamp, TCPTimestamp:tcpTimestamp }
+			cd.TimingPairs=append(cd.TimingPairs, tp)
+
+			// For debugging
+			// if tcp.SrcPort==726 && tcp.DstPort==2049 {
+			// 	b.Reset()
+			// 	captureMs:=timeDurationToMilliseconds(ci.Timestamp.Sub(cd.CaptureStart))
+			// 	tcpTimestampDelta:=tcpTimestampDelta(cd.TCPTsStart, cd.TCPTsEnd)
+			// 	fmt.Fprintf(&b, "XX Packet %6d @ %6d ms %6d tcpts %5d delta: ", 
+			// 		        packetID, captureMs, tcpTimestampDelta, captureMs-tcpTimestampDelta)
+			// 	printPacketInfo(&b, eth, ipv4, tcp);
+			// 	log.Print(b.String())
+			// }
+
+			break;
 		}
-
-		if(haveTCPTimestamp) {
-			// calculate conversion factor 
-			captureDuration:=ci.Timestamp.Sub(cd.CaptureStart)
-			captureMs      :=timeDurationToMilliseconds(captureDuration)
-			if captureMs==0 {
-				captureMs=1
-			}
-
-			tcpTsDelta     :=tcpTimestampDelta(cd.TCPTsStart, cd.TCPTsEnd)
-			if tcpTsDelta==0 {
-				tcpTsDelta=1
-			}
-
-			thisMsPerTCPTs:=float32(float64(captureMs)/float64(tcpTsDelta))
-
-			// update running average for this connection
-			cd.MsPerTCPTs+=thisMsPerTCPTs
-			cd.MsPerTCPTsCount++
-		}
-
-		//if needForDebug==true {
-		//	log.Printf("Packet %6d @ %6dms %6dtcpts : ", 
-		//		packetID, timeDurationToMilliseconds(cd.CaptureEnd.Sub(cd.CaptureStart)), cd.TCPTsEnd-cd.TCPTsStart)
-		//	printPacketInfo(eth, ipv4, tcp);
-		//}
 
 		res.ConnDataMap[conn]=cd;
 	}		
+
+	if len(parserErrors)>0 {
+		log.Print("\nError summary:")
+		numErrors:=uint32(0)
+		for k,v :=range parserErrors {
+			log.Printf("%6d times %v", v, k)
+			numErrors+=v
+		}		
+		log.Printf("%6d parser errors total", numErrors)
+		log.Print("")
+	}
 
 	return res
 }
@@ -310,35 +321,167 @@ func buildTimestampConversionTable(connDataMap map[Connection]ConnData) {
 			tcpTsDelta=1
 		}
 
-		ccdp.MsPerTCPTs/=float32(ccdp.MsPerTCPTsCount)
-		ccdp.MsPerTCPTsCount=1
+		// ccdp.MsPerTCPTs/=float32(ccdp.MsPerTCPTsCount)
+		// ccdp.MsPerTCPTsCount=1
+
 		//ccdp.MsPerTCPTs   =float32(float64(captureMs)/float64(tcpTsDelta))
-		if ccdp.MsPerTCPTs>0 && ccdp.MsPerTCPTs<1 {
-			ccdp.MsPerTCPTs=1	
-		}
+
+		ccdp.MsPerTCPTs=estimateSlope(ccdp.TimingPairs)
+		// if ccdp.MsPerTCPTs>0 && ccdp.MsPerTCPTs<1 {
+		// 	ccdp.MsPerTCPTs=1	
+		// }
 		if ccdp.MsPerTCPTs<0 && ccdp.MsPerTCPTs>-1 {
 			ccdp.MsPerTCPTs=-1	
 		}
+		ccdp.MsOffset  =estimateIntercept(ccdp.TimingPairs, ccdp.MsPerTCPTs)
+		ccdp.TimingPairs=nil // free memory
 
 		connDataMap[ccdp.Connection]=ccdp.ConnData
 
+
 		// print outliers only
-		if (ccdp.MsPerTCPTs<0.98 || ccdp.MsPerTCPTs>1.02) && captureMs>500 {
+		if captureMs>500 && ! (
+			(ccdp.MsPerTCPTs>=0.97 && ccdp.MsPerTCPTs<=1.03) ||
+			(ccdp.MsPerTCPTs>=3.97 && ccdp.MsPerTCPTs<=4.03)    )  {
+            numOutlierConnections++
 			log.Printf("%3d.%3d.%3d.%3d:%5d -> %3d.%3d.%3d.%3d:%5d syn %2d: %6d packets cap start %v end %v tcpts start %9d end %d delta %7d ms %7d tcpTs %1.2f ms/tcpTs\n", 
 		           ccdp.SrcIP>>24, (ccdp.SrcIP>>16) & 0xff, (ccdp.SrcIP>>8) & 0xff, ccdp.SrcIP & 0xff, ccdp.SrcPort, 
 		           ccdp.DstIP>>24, (ccdp.DstIP>>16) & 0xff, (ccdp.DstIP>>8) & 0xff, ccdp.DstIP & 0xff, ccdp.DstPort, 
 		           ccdp.SynCount, ccdp.NumPackets,
 		           ccdp.CaptureStart, ccdp.CaptureEnd, ccdp.TCPTsStart, ccdp.TCPTsEnd,
 		           captureMs, tcpTsDelta, ccdp.MsPerTCPTs)
-            numOutlierConnections++
         }
     }
     log.Printf("Total %d conversion ratio outliers (%f%% of connections)\n", numOutlierConnections, float64(numOutlierConnections)*100.0/float64(len(ccdps)))
 }
 
+// Estimate the slope of the conversion from TCP timestamps to wall clock milliseconds.
+// Uses the median of the slope between randomly sampled pairs.
+func estimateSlope(tp []TimingPair) float32 {
+	l:=uint32(len(tp))
+	if l<2 {
+		return 1
+	} else if l==2 {
+		captureMsDelta   :=timeDurationToMilliseconds(tp[1].Capture.Sub(tp[0].Capture))
+		if captureMsDelta==0 { return 1.0 }
+		tcpTimestampDelta:=tcpTimestampDelta(tp[0].TCPTimestamp, tp[1].TCPTimestamp)
+		if tcpTimestampDelta==0 { return 1.0 }
+		return float32(captureMsDelta) / float32(tcpTimestampDelta)
+	}
+
+	samplesToTake:=20*l
+	samples:=make([]float32, samplesToTake)
+	samplesTaken:=0
+
+	// calculate ratios
+	for num:=uint32(0); num<samplesToTake; num++ {
+		i:=    rng.Uint32n(l/3) 
+		j:=l-1-rng.Uint32n(l/3)
+
+		captureMsDelta   :=timeDurationToMilliseconds(tp[j].Capture.Sub(tp[i].Capture))
+		if captureMsDelta==0 { continue }
+		tcpTimestampDelta:=tcpTimestampDelta(tp[i].TCPTimestamp, tp[j].TCPTimestamp)
+		if tcpTimestampDelta==0 { continue }
+
+		sample := float32(captureMsDelta) / float32(tcpTimestampDelta)
+		samples[samplesTaken]=sample
+		samplesTaken++
+	}
+	if samplesTaken==0 {
+		return 1.0
+	}
+
+	// use median as statistically robust estimator in the presence of outliers
+	return QSelectMedianFloat32(samples[:samplesTaken])
+}
+
+
+// Estimate the intercept, given the slope
+func estimateIntercept(tp []TimingPair, msPerTCPTs float32) float32 {
+	l:=uint32(len(tp))
+	if l<2 {
+		return 1
+	} else if l==2 {
+		captureMsDelta   :=timeDurationToMilliseconds(tp[1].Capture.Sub(tp[0].Capture))
+		if captureMsDelta==0 { return 0.0 }
+		tcpTimestampDelta:=tcpTimestampDelta(tp[0].TCPTimestamp, tp[1].TCPTimestamp)
+		if tcpTimestampDelta==0 { return 0.0 }
+		return float32(captureMsDelta) / float32(tcpTimestampDelta)
+	}
+
+	samplesToTake:=20*l
+	samples:=make([]float32, samplesToTake)
+	samplesTaken:=0
+
+	// calculate ratios
+	for num:=uint32(0); num<samplesToTake; num++ {
+		i:=    rng.Uint32n(l/3) 
+		j:=l-1-rng.Uint32n(l/3)
+
+		captureMsDelta   :=timeDurationToMilliseconds(tp[j].Capture.Sub(tp[i].Capture))
+		if captureMsDelta==0 { continue }
+		tcpTimestampDelta:=tcpTimestampDelta(tp[i].TCPTimestamp, tp[j].TCPTimestamp)
+		if tcpTimestampDelta==0 { continue }
+
+		sample := float32(captureMsDelta) - float32(tcpTimestampDelta)*msPerTCPTs
+		samples[samplesTaken]=sample
+		samplesTaken++
+	}
+	if samplesTaken==0 {
+		return 0.0
+	}
+
+	// use median as statistically robust estimator in the presence of outliers
+	return QSelectMedianFloat32(samples[:samplesTaken])
+}
+
+
+// Select median of an array of float32. Partially reorders the array.
+// Array must not contain IEEE NaN
+func QSelectMedianFloat32(a []float32) float32 {
+    return QSelectFloat32(a, (len(a)>>1)+1)
+}
+
+
+// Select kth lowest element from an array of float32. Partially reorders the array.
+// Array must not contain IEEE NaN
+func QSelectFloat32(a []float32, k int) float32 {
+    left, right:=0, len(a)-1
+    for left<right {
+        // partition
+        mid:=(left+right)>>1
+        pivot := a[mid]
+        l, r  := left-1, right+1
+        for {
+            for {
+                l++
+                // if l>=len(a) { CheckNaNs(a) }
+                if a[l]>=pivot { break }
+            }
+            for {
+                r--
+                // if r<0 { CheckNaNs(a) }
+                if a[r]<=pivot { break }
+            }
+            if l >= r { break } // index in r
+            a[l], a[r] = a[r], a[l]
+        }
+        index:=r
+
+        offset:=index-left+1
+        if k<=offset {
+            right=index
+        } else {
+            left=index+1
+            k=k-offset
+        }
+    }
+    return a[left]
+}
+
 
 // Find packets whose TCP timestamps differ from the wall clock by more than the expected time
-func findOutliers(fileName string, connDataMap map[Connection]ConnData, thresholdMs int64) (numOutliers uint32) {
+func findOutliers(fileName string, connDataMap map[Connection]ConnData, thresholdMs int64) {
 	handleRead, err := pcap.OpenOffline(fileName)
 	if err != nil {
 		log.Fatal("Error opening PCAP file:", err)
@@ -356,6 +499,12 @@ func findOutliers(fileName string, connDataMap map[Connection]ConnData, threshol
 
 	synCountMap:=map[SrcDestPair]uint32{}
 	var packetID uint64=0
+	var numPacketsTCP uint64
+
+	var numOutliers uint32=0
+	var missingTimestamps []uint64
+
+	var b strings.Builder
 
 	for {
 		data, ci, err := handleRead.ReadPacketData()
@@ -367,7 +516,6 @@ func findOutliers(fileName string, connDataMap map[Connection]ConnData, threshol
 		
 		packetID++
 		if err := parser.DecodeLayers(data, &decoded); err != nil {
-			//fmt.Fprintf(os.Stderr, "Could not decode layer: %v\n", err)
 			continue
 		}
 
@@ -379,9 +527,9 @@ func findOutliers(fileName string, connDataMap map[Connection]ConnData, threshol
 			case layers.LayerTypeDot1Q:
 			case layers.LayerTypeIPv4:
 				haveIPv4=true
-			case layers.LayerTypeIPv6:
 			case layers.LayerTypeTCP:
 			  	haveTCP=true
+			  	numPacketsTCP++
 			default: // Ignore payload
 			}
 		}
@@ -412,8 +560,6 @@ func findOutliers(fileName string, connDataMap map[Connection]ConnData, threshol
 		var captureMsSinceStart uint32
 		var deltaMs int64
 
-		var b strings.Builder
-
 		// evaluate TCP timestamp if present
 		haveTCPTimestamp:=false
 		for _,o:=range(tcp.Options) {
@@ -424,7 +570,7 @@ func findOutliers(fileName string, connDataMap map[Connection]ConnData, threshol
 			// convert TCP timestamp into equivalent milliseconds since start of connection capture
 			tcpTs         :=tcpTimestampFromBytes(o.OptionData)
 			tcpTsSinceStart=tcpTimestampDelta(cd.TCPTsStart, tcpTs)
-			tcpMsSinceStart=int64(float64(tcpTsSinceStart)*float64(cd.MsPerTCPTs))
+			tcpMsSinceStart=int64(float64(tcpTsSinceStart)*float64(cd.MsPerTCPTs)+float64(cd.MsOffset))
 
 			// convert capture timestamp into estimated milliseconds since start of connection capture
 			captureMsSinceStart=uint32(timeDurationToMilliseconds(ci.Timestamp.Sub(cd.CaptureStart)))
@@ -439,18 +585,22 @@ func findOutliers(fileName string, connDataMap map[Connection]ConnData, threshol
 			}
 		}
 
-		if !haveTCPTimestamp && cd.MsPerTCPTs<0 {
-			b.Reset()
-			fmt.Fprintf(&b,"Packet %6d @ %v tcpts MISSING   connSince %6d ms MISSING tcpms delta MISSING ms synCt %02d: ", 
-				packetID, ci.Timestamp,  timeDurationToMilliseconds(ci.Timestamp.Sub(cd.CaptureStart)), synCount)
-			printPacketInfo(&b, eth, ipv4, tcp);
-			log.Print(b.String())
-			numOutliers++
+		if !haveTCPTimestamp {
+			missingTimestamps=append(missingTimestamps, packetID)
 		}
 
 	}		
 
-	return numOutliers
+	log.Printf("Total %d outlier packets (%f%% of TCP packets).\n", numOutliers, float64(numOutliers)*100.0/float64(numPacketsTCP))
+	if len(missingTimestamps)>0 {
+		log.Printf("And %d TCP packets without TCP timestamps:", len(missingTimestamps))
+		b.Reset()
+		fmt.Fprintf(&b, "%d", missingTimestamps[0])
+		for _,pid := range(missingTimestamps[1:]) {
+			fmt.Fprintf(&b, " %d", pid)
+		}		
+		log.Print(b.String())
+	}
 }
 
 // Creates a uint32 TCP timestamp from byte array
