@@ -309,7 +309,7 @@ func buildTimestampConversionTable(connDataMap map[Connection]ConnData) {
 	})
 
 	numOutlierConnections:=0
-	for _,ccdp:=range(ccdps) {
+	for c,ccdp:=range(ccdps) {
 		captureDuration:=ccdp.CaptureEnd.Sub(ccdp.CaptureStart)
 		captureMs      :=timeDurationToMilliseconds(captureDuration)
 		if captureMs==0 {
@@ -340,16 +340,17 @@ func buildTimestampConversionTable(connDataMap map[Connection]ConnData) {
 
 
 		// print outliers only
-		if captureMs>500 && ! (
+		if captureMs>500 && !(
 			(ccdp.MsPerTCPTs>=0.97 && ccdp.MsPerTCPTs<=1.03) ||
-			(ccdp.MsPerTCPTs>=3.97 && ccdp.MsPerTCPTs<=4.03)    )  {
+			(ccdp.MsPerTCPTs>=3.97 && ccdp.MsPerTCPTs<=4.03)    ) && !(ccdp.MsOffset>=-1 && ccdp.MsOffset<=1)  {
             numOutlierConnections++
-			log.Printf("%3d.%3d.%3d.%3d:%5d -> %3d.%3d.%3d.%3d:%5d syn %2d: %6d packets cap start %v end %v tcpts start %9d end %d delta %7d ms %7d tcpTs %1.2f ms/tcpTs\n", 
+			log.Printf("Conn %4d: %3d.%3d.%3d.%3d:%5d -> %3d.%3d.%3d.%3d:%5d syn %2d: %6d packets cap start %v end %v tcpts start %9d end %d delta %7d ms %7d tcpTs ms=%1.2f tcp %+1.2f\n", 
+		           c,
 		           ccdp.SrcIP>>24, (ccdp.SrcIP>>16) & 0xff, (ccdp.SrcIP>>8) & 0xff, ccdp.SrcIP & 0xff, ccdp.SrcPort, 
 		           ccdp.DstIP>>24, (ccdp.DstIP>>16) & 0xff, (ccdp.DstIP>>8) & 0xff, ccdp.DstIP & 0xff, ccdp.DstPort, 
 		           ccdp.SynCount, ccdp.NumPackets,
 		           ccdp.CaptureStart, ccdp.CaptureEnd, ccdp.TCPTsStart, ccdp.TCPTsEnd,
-		           captureMs, tcpTsDelta, ccdp.MsPerTCPTs)
+		           captureMs, tcpTsDelta, ccdp.MsPerTCPTs, ccdp.MsOffset)
         }
     }
     log.Printf("Total %d conversion ratio outliers (%f%% of connections)\n", numOutlierConnections, float64(numOutlierConnections)*100.0/float64(len(ccdps)))
@@ -502,7 +503,6 @@ func findOutliers(fileName string, connDataMap map[Connection]ConnData, threshol
 	var numPacketsTCP uint64
 
 	var numOutliers uint32=0
-	var missingTimestamps []uint64
 
 	var b strings.Builder
 
@@ -577,8 +577,11 @@ func findOutliers(fileName string, connDataMap map[Connection]ConnData, threshol
 			deltaMs=int64(captureMsSinceStart)-int64(tcpMsSinceStart)
 			if deltaMs>thresholdMs || deltaMs< (-thresholdMs) || cd.MsPerTCPTs<0 {
 				b.Reset()
-				fmt.Fprintf(&b,"Packet %6d @ %v tcpts %9d connSince %6d ms %7d tcpts %7d tcpms delta %7d ms synCt %02d: ", 
-					packetID, ci.Timestamp,  tcpTs, captureMsSinceStart, tcpTsSinceStart, tcpMsSinceStart, deltaMs, synCount)
+				fmt.Fprintf(&b,"Pack %6d: %3d.%3d.%3d.%3d:%5d -> %3d.%3d.%3d.%3d:%5d syn %2d: captured %v tcpts %9d capms %7d tcpms %7d delta %6d ", 
+	            packetID,
+	            conn.SrcIP>>24, (conn.SrcIP>>16) & 0xff, (conn.SrcIP>>8) & 0xff, conn.SrcIP & 0xff, conn.SrcPort, 
+	            conn.DstIP>>24, (conn.DstIP>>16) & 0xff, (conn.DstIP>>8) & 0xff, conn.DstIP & 0xff, conn.DstPort, 
+	            conn.SynCount, ci.Timestamp, tcpTs, captureMsSinceStart, tcpMsSinceStart, deltaMs)
 				printPacketInfo(&b, eth, ipv4, tcp);
 				log.Print(b.String())
 				numOutliers++
@@ -586,21 +589,19 @@ func findOutliers(fileName string, connDataMap map[Connection]ConnData, threshol
 		}
 
 		if !haveTCPTimestamp {
-			missingTimestamps=append(missingTimestamps, packetID)
+			b.Reset()
+			fmt.Fprintf(&b,"Pack %6d: %3d.%3d.%3d.%3d:%5d -> %3d.%3d.%3d.%3d:%5d syn %2d: captured %v tcpts NONE      capms %7d tcpms NONE    delta NONE   ", 
+	            packetID,
+	            conn.SrcIP>>24, (conn.SrcIP>>16) & 0xff, (conn.SrcIP>>8) & 0xff, conn.SrcIP & 0xff, conn.SrcPort, 
+	            conn.DstIP>>24, (conn.DstIP>>16) & 0xff, (conn.DstIP>>8) & 0xff, conn.DstIP & 0xff, conn.DstPort, 
+	            conn.SynCount, ci.Timestamp, captureMsSinceStart)
+			printPacketInfo(&b, eth, ipv4, tcp);
+			log.Print(b.String())
+			numOutliers++
 		}
-
 	}		
 
 	log.Printf("Total %d outlier packets (%f%% of TCP packets).\n", numOutliers, float64(numOutliers)*100.0/float64(numPacketsTCP))
-	if len(missingTimestamps)>0 {
-		log.Printf("And %d TCP packets without TCP timestamps:", len(missingTimestamps))
-		b.Reset()
-		fmt.Fprintf(&b, "%d", missingTimestamps[0])
-		for _,pid := range(missingTimestamps[1:]) {
-			fmt.Fprintf(&b, " %d", pid)
-		}		
-		log.Print(b.String())
-	}
 }
 
 // Creates a uint32 TCP timestamp from byte array
@@ -631,9 +632,9 @@ func ipToUInt32(ts []byte) uint32 {
 
 // Pretty prints a packet
 func printPacketInfo(b io.Writer, eth layers.Ethernet, ipv4 layers.IPv4, tcp layers.TCP) {
-	fmt.Fprintf(b, "[%v] %v:%v -> ", eth.SrcMAC, ipv4.SrcIP, tcp.SrcPort)
-	fmt.Fprintf(b, "%v:%v [%v]", ipv4.DstIP, tcp.DstPort, eth.DstMAC)
-	fmt.Fprintf(b, " Seq %d Flags", tcp.Seq)
+	//fmt.Fprintf(b, "[%v] %v:%v -> ", eth.SrcMAC, ipv4.SrcIP, tcp.SrcPort)
+	//fmt.Fprintf(b, "%v:%v [%v]", ipv4.DstIP, tcp.DstPort, eth.DstMAC)
+	fmt.Fprintf(b, " seq %d flags", tcp.Seq)
 	if(tcp.FIN) { fmt.Fprintf(b, " FIN") }
 	if(tcp.SYN) { fmt.Fprintf(b, " SYN") }
 	if(tcp.RST) { fmt.Fprintf(b, " RST") }
