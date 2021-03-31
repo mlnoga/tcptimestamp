@@ -27,7 +27,7 @@ import (
 var readFileName          = flag.String("r", "",    "Filename for input PCAP file")
 var writeFileName         = flag.String("w", "",    "Filename for output analysis file. Overrides potential filename generation")
 var generateWriteFileName = flag.Bool  ("g", false, "Generate output file by appending .analysis to the input filename")
-var threshold             = flag.Int64 ("t", 5000,  "Theshold in ms for max acceptable difference between capture and TCP timestamps")
+var threshold             = flag.Int64 ("t", 1000,  "Theshold in ms for max acceptable difference between capture and TCP timestamps")
 
 
 type SrcDestPair struct {
@@ -342,7 +342,7 @@ func buildTimestampConversionTable(connDataMap map[Connection]ConnData) {
 		// print outliers only
 		if captureMs>500 && !(
 			(ccdp.MsPerTCPTs>=0.97 && ccdp.MsPerTCPTs<=1.03) ||
-			(ccdp.MsPerTCPTs>=3.97 && ccdp.MsPerTCPTs<=4.03)    ) && !(ccdp.MsOffset>=-1 && ccdp.MsOffset<=1)  {
+			(ccdp.MsPerTCPTs>=3.97 && ccdp.MsPerTCPTs<=4.03)    )  {
             numOutlierConnections++
 			log.Printf("Conn %4d: %3d.%3d.%3d.%3d:%5d -> %3d.%3d.%3d.%3d:%5d syn %2d: %6d packets cap start %v end %v tcpts start %9d end %d delta %7d ms %7d tcpTs ms=%1.2fx tcpts %+1.2f\n", 
 		           c,
@@ -588,7 +588,8 @@ func findOutliers(fileName string, connDataMap map[Connection]ConnData, threshol
 			}
 		}
 
-		if !haveTCPTimestamp {
+		// Show packets w/o timestamps except resets, because timestamps on resets are recommended but not mandatory
+		if (!haveTCPTimestamp) && ((!tcp.RST) || (cd.MsPerTCPTs<0)) {
 			b.Reset()
 			fmt.Fprintf(&b,"Pack %6d: %3d.%3d.%3d.%3d:%5d -> %3d.%3d.%3d.%3d:%5d syn %2d: captured %v tcpts NONE      capms %7d tcpms NONE    delta NONE   ", 
 	            packetID,
