@@ -28,6 +28,7 @@ var readFileName          = flag.String("r", "",    "Filename for input PCAP fil
 var writeFileName         = flag.String("w", "",    "Filename for output analysis file. Overrides potential filename generation")
 var generateWriteFileName = flag.Bool  ("g", false, "Generate output file by appending .analysis to the input filename")
 var threshold             = flag.Int64 ("t", 1000,  "Theshold in ms for max acceptable difference between capture and TCP timestamps")
+var onePassAssuming       = flag.Int64 ("o", 0,     "Perform one pass analysis given this number of ms per TCP timestamp tick, 0 for off")
 
 
 type SrcDestPair struct {
@@ -52,6 +53,12 @@ type CaptureData struct {
 type TimingPair struct {
 	Capture 	 time.Time
 	TCPTimestamp uint32
+}
+
+type TimingPairSyn struct {
+	Capture 	 time.Time
+	TCPTimestamp uint32
+	SynCount     uint32
 }
 
 type ConnData struct {
@@ -117,29 +124,156 @@ func main() {
 	// Open PCAP file
 	log.Printf("Scanning trace file %s\n", *readFileName)
 
-	// Main challenge: establish a basis to convert RFC 1323 TCP timestamps, which are only guaranteed
-	// to be proportional to wall clock time from the capture itself, on a per connection basis 
-	log.Printf("\nCollect start/end times\n-----------------------\n")
-	stats:=collectStartEndTimes(*readFileName)
+	if *onePassAssuming!=0 {
+		findOutliersOnePass(*readFileName, *onePassAssuming, *threshold)
+	} else {
+		// Main challenge: establish a basis to convert RFC 1323 TCP timestamps, which are only guaranteed
+		// to be proportional to wall clock time from the capture itself, on a per connection basis 
+		log.Printf("\nCollect start/end times\n-----------------------\n")
+		stats:=collectStartEndTimes(*readFileName)
 
-	duration:=stats.CaptureEnd.Sub(stats.CaptureStart)
-	log.Printf("Capture covers time from  %v to %v (%v)\n",stats.CaptureStart, stats.CaptureEnd, duration)
-    log.Printf("Total %d packets of size %d at %.1f packets/second\n", 
-		stats.NumPackets, stats.NumBytes, float64(stats.NumPackets)/duration.Seconds())
-    log.Printf("Thereof %d ethernet, %d Dot1Q, %d ipv4 and %d tcp\n", 
-		stats.PacketsEthernet, stats.PacketsDot1Q, stats.PacketsIPv4, stats.PacketsTCP)
-	log.Printf("Found %d connections based on src/dst ip, src/dest port and syn count.\n", len(stats.ConnDataMap))
+		duration:=stats.CaptureEnd.Sub(stats.CaptureStart)
+		log.Printf("Capture covers time from  %v to %v (%v)\n",stats.CaptureStart, stats.CaptureEnd, duration)
+	    log.Printf("Total %d packets of size %d at %.1f packets/second\n", 
+			stats.NumPackets, stats.NumBytes, float64(stats.NumPackets)/duration.Seconds())
+	    log.Printf("Thereof %d ethernet, %d Dot1Q, %d ipv4 and %d tcp\n", 
+			stats.PacketsEthernet, stats.PacketsDot1Q, stats.PacketsIPv4, stats.PacketsTCP)
+		log.Printf("Found %d connections based on src/dst ip, src/dest port and syn count.\n", len(stats.ConnDataMap))
 
-	// Build conversion table
-	log.Printf("\nBuild TCP timestamp/ms conversions\n----------------------------------\n")
-	buildTimestampConversionTable(stats.ConnDataMap)
+		// Build conversion table
+		log.Printf("\nBuild TCP timestamp/ms conversions\n----------------------------------\n")
+		buildTimestampConversionTable(stats.ConnDataMap)
 
-	// Find outliers
-	log.Printf("\nFind Outliers\n-------------\n")
-	findOutliers(*readFileName, stats.ConnDataMap, *threshold)
+		// Find outliers
+		log.Printf("\nFind Outliers\n-------------\n")
+		findOutliers(*readFileName, stats.ConnDataMap, *threshold)
+	}
 
 	log.Printf("\nExiting after %v\n", time.Since(start).Truncate(100*time.Millisecond))	
 }
+
+
+// Find outliers in one pass, assuming given conversion ratio from TCP timestamps to ms, and using given threshold
+func findOutliersOnePass(fileName string, msPerTCPTs int64, threshold int64)  {
+	handleRead, err := pcap.OpenOffline(fileName)
+	if err != nil {
+		log.Fatal("Error opening PCAP file:", err)
+	}
+	defer handleRead.Close()
+
+	var eth layers.Ethernet
+	var dot1q layers.Dot1Q
+	var ipv4 layers.IPv4
+	var tcp layers.TCP
+	var payload gopacket.Payload
+
+	parser  := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &dot1q, &ipv4, &tcp, &payload)
+	decoded := []gopacket.LayerType{}
+
+	var numPackets  uint64
+	var numOutliers uint64
+
+	timingPairSynMap:=map[SrcDestPair]TimingPairSyn{}
+
+	parserErrors:=map[string]uint32{}
+	var b strings.Builder
+
+	for {
+		data, ci, err := handleRead.ReadPacketData()
+		if err != nil && err != io.EOF {
+			log.Fatal(err)
+		} else if err == io.EOF {
+			break
+		} 
+
+		numPackets++
+
+		if err := parser.DecodeLayers(data, &decoded); err != nil {
+			if parserErrors[err.Error()]==0 {
+				log.Printf("Warning: packet %6d: %s; skipping in this and all future packets\n", numPackets, err)
+			}
+			parserErrors[err.Error()]++
+			continue
+		}
+
+		var haveEthernet, haveIPv4, haveTCP bool
+		for _, layerType := range decoded {
+			switch layerType {
+			case layers.LayerTypeEthernet:
+				haveEthernet=true
+			case layers.LayerTypeDot1Q:
+			case layers.LayerTypeIPv4:
+				haveIPv4=true
+			case layers.LayerTypeTCP:
+			  	haveTCP=true
+			default: // Ignore payload
+			}
+		}
+
+		if !haveEthernet || !haveIPv4 || !haveTCP {  // keep valid packets only
+			continue
+		}
+
+		srcDestPair:=SrcDestPair{ 
+			SrcIP   : ipToUInt32(ipv4.SrcIP),
+			DstIP   : ipToUInt32(ipv4.DstIP),
+			SrcPort : tcp.SrcPort,
+			DstPort : tcp.DstPort,
+		}
+		tps:=timingPairSynMap[srcDestPair]
+		if tcp.SYN {
+			tps.SynCount++
+			var zero time.Time
+			tps.Capture=zero
+			tps.TCPTimestamp=0
+			timingPairSynMap[srcDestPair]=tps
+		}
+
+		// evaluate TCP timestamp if present
+		for _,o:=range(tcp.Options) {
+			if o.OptionType!=8 {  
+				continue;
+			} 
+			tcpTs:=tcpTimestampFromBytes(o.OptionData)
+			if tps.Capture.IsZero() {
+				tps.Capture      = ci.Timestamp
+				tps.TCPTimestamp = tcpTs
+				timingPairSynMap[srcDestPair]=tps
+			}
+
+			tcpMsSinceStart    :=tcpTimestampDelta(tps.TCPTimestamp, tcpTs)*msPerTCPTs
+			captureMsSinceStart:=timeDurationToMilliseconds(ci.Timestamp.Sub(tps.Capture))
+			deltaMs            :=captureMsSinceStart-tcpMsSinceStart
+			if deltaMs>threshold || deltaMs<(-threshold) {
+				b.Reset()
+
+				fmt.Fprintf(&b,"Packet %d: %d.%d.%d.%d:%d -> %d.%d.%d.%d:%d syn %d: captured %v tcpts %9d capms %7d tcpms %7d deltams %6d ", 
+	            numPackets,
+	            srcDestPair.SrcIP>>24, (srcDestPair.SrcIP>>16) & 0xff, (srcDestPair.SrcIP>>8) & 0xff, srcDestPair.SrcIP & 0xff, srcDestPair.SrcPort, 
+	            srcDestPair.DstIP>>24, (srcDestPair.DstIP>>16) & 0xff, (srcDestPair.DstIP>>8) & 0xff, srcDestPair.DstIP & 0xff, srcDestPair.DstPort, 
+	            tps.SynCount, ci.Timestamp, tcpTs, captureMsSinceStart, tcpMsSinceStart, deltaMs)
+				printPacketInfo(&b, eth, ipv4, tcp);
+				log.Print(b.String())
+				numOutliers++
+			}
+
+			break;
+		}
+	}		
+
+	log.Printf("Total %d packets read with %d outliers", numPackets, numOutliers)
+	if len(parserErrors)>0 {
+		log.Print("\nError summary:")
+		numErrors:=uint32(0)
+		for k,v :=range parserErrors {
+			log.Printf("%6d times %v", v, k)
+			numErrors+=v
+		}		
+		log.Printf("%6d parser errors total", numErrors)
+		log.Print("")
+	}
+}
+
 
 
 // Find connections and collect wall clock and TCP timestamps per connection
