@@ -8,7 +8,7 @@ A tool which hunts for TCP timestamp inconsistencies in PCAP files
 * [PCAP](https://pcapng.github.io/pcapng/draft-gharris-opsawg-pcap.html) file format
 
 # Prerequisites
-* go v1.9 or higher
+* go v1.10 or higher
 * gcc
 * libpcap
 * libpcap-devel
